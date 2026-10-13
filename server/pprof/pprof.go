@@ -1,139 +1,122 @@
-// Package pprof provides a Go pprof profiling endpoint RunProvider.
+// Package pprof serves Go runtime profiles (net/http/pprof) on a dedicated
+// port as a run provider.
 //
-// Standalone usage (Pattern A, no Wire):
+//	g.MustInit(pprof.New(nil))
+//	g.MustRun() // go tool pprof http://127.0.0.1:9999/debug/pprof/profile
 //
-//	c := container.New()
-//	c.MustInit(pprof.New(nil))
-//	c.MustRun()  // exposes profiling at PPROF_ENDPOINT (default: /debug/pprof:9999)
-//
-// Wire usage (Pattern B) – add pprof.ProviderSet to wire.Build():
-//
-//	wire.Build(pprof.NewConfigFromEnv, pprof.NewServer, ...)
+// The server listens on 127.0.0.1 by default and can be switched off with
+// PPROF_ENABLED=false.
 package pprof
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/pprof"
-	"time"
+	"strings"
 
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
+	"github.com/google/wire"
+
+	"github.com/versegeek/toolkit/internal/httpserver"
 	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Server.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewServer)
 
-// Config holds pprof server parameters.
-type Config struct {
-	Enabled  bool
-	Port     int
-	Endpoint string
-}
+// standardPrefix is the path net/http/pprof expects for named profiles.
+const standardPrefix = "/debug/pprof/"
 
-const (
-	defaultEnabled  = true
-	defaultPort     = 9999
-	defaultEndpoint = "/debug/pprof"
-)
-
-// NewConfigFromEnv reads pprof configuration from the environment.
-// Keys: PPROF_ENABLED, PPROF_PORT, PPROF_ENDPOINT.
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("PPROF_ENABLED", defaultEnabled)
-	v.SetDefault("PPROF_PORT", defaultPort)
-	v.SetDefault("PPROF_ENDPOINT", defaultEndpoint)
-
-	cfg := &Config{
-		Enabled:  v.GetBool("PPROF_ENABLED"),
-		Port:     v.GetInt("PPROF_PORT"),
-		Endpoint: v.GetString("PPROF_ENDPOINT"),
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"enabled":  cfg.Enabled,
-		"port":     cfg.Port,
-		"endpoint": cfg.Endpoint,
-	}).Debug("PProf config loaded")
-
-	return cfg
-}
-
-// ─── Server ───────────────────────────────────────────────────────────────────
-
-// Server exposes Go pprof profiling endpoints as a lifecycle-managed RunProvider.
+// Server serves the profiling endpoints as a run provider.
 type Server struct {
 	provider.AbstractRunProvider
 
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
 	Config *Config
-	srv    *http.Server
+
+	srv *http.Server
 }
 
-var _ provider.RunProvider = (*Server)(nil)
+var (
+	_ provider.RunProvider = (*Server)(nil)
+	_ provider.Enabler     = (*Server)(nil)
+)
 
-// New creates a Server.
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Server that is not initialised yet.
 func New(cfg *Config) *Server {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Server{Config: cfg}
 }
 
-// NewServer is the Wire-compatible constructor.
+// NewServer returns an initialised Server and a cleanup that closes it.
 func NewServer(cfg *Config) (*Server, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Run starts the pprof HTTP server. Blocks until stopped.
-// If Enabled is false, returns immediately.
-func (s *Server) Run() error {
+// Enabled reports whether the server is switched on. It reports true while
+// the configuration has not been loaded yet.
+func (s *Server) Enabled() bool {
+	return s.Config == nil || s.Config.Enabled
+}
+
+// Init prepares the server unless it is disabled.
+func (s *Server) Init() error {
+	if s.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		s.Config = cfg
+	}
 	if !s.Config.Enabled {
-		logrus.Info("PProf server disabled")
 		return nil
 	}
 
-	addr := fmt.Sprintf(":%d", s.Config.Port)
-	ep := s.Config.Endpoint
+	profiles := http.NewServeMux()
+	profiles.HandleFunc(standardPrefix, pprof.Index)
+	profiles.HandleFunc(standardPrefix+"cmdline", pprof.Cmdline)
+	profiles.HandleFunc(standardPrefix+"profile", pprof.Profile)
+	profiles.HandleFunc(standardPrefix+"symbol", pprof.Symbol)
+	profiles.HandleFunc(standardPrefix+"trace", pprof.Trace)
 
+	// pprof.Index only serves named profiles under /debug/pprof/, so requests
+	// under a custom endpoint are rewritten to that prefix.
+	endpoint := s.Config.endpoint()
 	mux := http.NewServeMux()
-	mux.HandleFunc(ep+"/", pprof.Index)
-	mux.HandleFunc(ep+"/cmdline", pprof.Cmdline)
-	mux.HandleFunc(ep+"/profile", pprof.Profile)
-	mux.HandleFunc(ep+"/symbol", pprof.Symbol)
-	mux.HandleFunc(ep+"/trace", pprof.Trace)
+	mux.HandleFunc(endpoint+"/", func(w http.ResponseWriter, r *http.Request) {
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = standardPrefix + strings.TrimPrefix(r.URL.Path, endpoint+"/")
+		r2.URL.RawPath = ""
+		profiles.ServeHTTP(w, r2)
+	})
 
-	s.srv = &http.Server{Addr: addr, Handler: mux}
-	s.SetRunning(true)
+	s.srv = httpserver.New(s.Config.addr(), mux)
+	return nil
+}
 
-	logrus.WithFields(logrus.Fields{
-		"addr":     addr,
-		"endpoint": ep,
-	}).Info("PProf server starting")
-
-	if err := s.srv.ListenAndServe(); err != http.ErrServerClosed {
-		return err
+// Run listens on the configured address and serves until Close. A disabled
+// server returns at once.
+func (s *Server) Run() error {
+	if s.Config != nil && !s.Config.Enabled {
+		return nil
+	}
+	if s.srv == nil {
+		return errors.New("pprof: run failed: server is not initialized")
+	}
+	if err := httpserver.Serve(s.srv, s.SetRunning); err != nil {
+		return fmt.Errorf("pprof: serve failed: %w", err)
 	}
 	return nil
 }
 
-// Close shuts down the pprof HTTP server.
+// Close shuts the server down gracefully within Config.ShutdownTimeout.
 func (s *Server) Close() error {
-	if !s.Config.Enabled || s.srv == nil {
-		return s.AbstractRunProvider.Close()
+	if s.srv == nil {
+		return nil
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := s.srv.Shutdown(ctx); err != nil {
-		logrus.WithError(err).Warn("PProf server shutdown error")
+	if err := httpserver.Shutdown(s.srv, s.Config.ShutdownTimeout); err != nil {
+		return fmt.Errorf("pprof: shutdown failed: %w", err)
 	}
-
-	return s.AbstractRunProvider.Close()
+	return nil
 }

@@ -1,133 +1,101 @@
-// Package prometheus provides a Prometheus metrics endpoint RunProvider.
+// Package prometheus serves Prometheus metrics from the default registry on a
+// dedicated port as a run provider.
 //
-// Standalone usage (Pattern A, no Wire):
+//	g.MustInit(prometheus.New(nil))
+//	g.MustRun() // curl http://localhost:9090/metrics
 //
-//	c := container.New()
-//	c.MustInit(prometheus.New(nil))
-//	c.MustRun()  // exposes metrics at PROMETHEUS_ENDPOINT (default: /metrics:9090)
-//
-// Wire usage (Pattern B) – add prometheus.ProviderSet to wire.Build():
-//
-//	wire.Build(prometheus.NewConfigFromEnv, prometheus.NewServer, ...)
+// The server can be switched off with PROMETHEUS_ENABLED=false.
 package prometheus
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"net/http"
-	"time"
 
+	"github.com/google/wire"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
+
+	"github.com/versegeek/toolkit/internal/httpserver"
 	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Server.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewServer)
 
-// Config holds Prometheus server parameters.
-type Config struct {
-	Enabled  bool
-	Port     int
-	Endpoint string
-}
-
-const (
-	defaultEnabled  = true
-	defaultPort     = 9090
-	defaultEndpoint = "/metrics"
-)
-
-// NewConfigFromEnv reads Prometheus configuration from the environment.
-// Keys: PROMETHEUS_ENABLED, PROMETHEUS_PORT, PROMETHEUS_ENDPOINT.
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("PROMETHEUS_ENABLED", defaultEnabled)
-	v.SetDefault("PROMETHEUS_PORT", defaultPort)
-	v.SetDefault("PROMETHEUS_ENDPOINT", defaultEndpoint)
-
-	cfg := &Config{
-		Enabled:  v.GetBool("PROMETHEUS_ENABLED"),
-		Port:     v.GetInt("PROMETHEUS_PORT"),
-		Endpoint: v.GetString("PROMETHEUS_ENDPOINT"),
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"enabled":  cfg.Enabled,
-		"port":     cfg.Port,
-		"endpoint": cfg.Endpoint,
-	}).Debug("Prometheus config loaded")
-
-	return cfg
-}
-
-// ─── Server ───────────────────────────────────────────────────────────────────
-
-// Server exposes Prometheus metrics as a lifecycle-managed RunProvider.
+// Server serves the metrics endpoint as a run provider.
 type Server struct {
 	provider.AbstractRunProvider
 
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
 	Config *Config
-	srv    *http.Server
+
+	srv *http.Server
 }
 
-var _ provider.RunProvider = (*Server)(nil)
+var (
+	_ provider.RunProvider = (*Server)(nil)
+	_ provider.Enabler     = (*Server)(nil)
+)
 
-// New creates a Server.
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Server that is not initialised yet.
 func New(cfg *Config) *Server {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Server{Config: cfg}
 }
 
-// NewServer is the Wire-compatible constructor.
+// NewServer returns an initialised Server and a cleanup that closes it.
 func NewServer(cfg *Config) (*Server, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Run starts the metrics HTTP server. Blocks until stopped.
-// If Enabled is false, returns immediately.
-func (s *Server) Run() error {
+// Enabled reports whether the server is switched on. It reports true while
+// the configuration has not been loaded yet.
+func (s *Server) Enabled() bool {
+	return s.Config == nil || s.Config.Enabled
+}
+
+// Init prepares the server unless it is disabled.
+func (s *Server) Init() error {
+	if s.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		s.Config = cfg
+	}
 	if !s.Config.Enabled {
-		logrus.Info("Prometheus server disabled")
 		return nil
 	}
 
-	addr := fmt.Sprintf(":%d", s.Config.Port)
-
 	mux := http.NewServeMux()
 	mux.Handle(s.Config.Endpoint, promhttp.Handler())
-	s.srv = &http.Server{Addr: addr, Handler: mux}
-	s.SetRunning(true)
+	s.srv = httpserver.New(s.Config.addr(), mux)
+	return nil
+}
 
-	logrus.WithFields(logrus.Fields{
-		"addr":     addr,
-		"endpoint": s.Config.Endpoint,
-	}).Info("Prometheus server starting")
-
-	if err := s.srv.ListenAndServe(); err != http.ErrServerClosed {
-		return err
+// Run listens on the configured address and serves until Close. A disabled
+// server returns at once.
+func (s *Server) Run() error {
+	if s.Config != nil && !s.Config.Enabled {
+		return nil
+	}
+	if s.srv == nil {
+		return errors.New("prometheus: run failed: server is not initialized")
+	}
+	if err := httpserver.Serve(s.srv, s.SetRunning); err != nil {
+		return fmt.Errorf("prometheus: serve failed: %w", err)
 	}
 	return nil
 }
 
-// Close shuts down the metrics HTTP server.
+// Close shuts the server down gracefully within Config.ShutdownTimeout.
 func (s *Server) Close() error {
-	if !s.Config.Enabled || s.srv == nil {
-		return s.AbstractRunProvider.Close()
+	if s.srv == nil {
+		return nil
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := s.srv.Shutdown(ctx); err != nil {
-		logrus.WithError(err).Warn("Prometheus server shutdown error")
+	if err := httpserver.Shutdown(s.srv, s.Config.ShutdownTimeout); err != nil {
+		return fmt.Errorf("prometheus: shutdown failed: %w", err)
 	}
-
-	return s.AbstractRunProvider.Close()
+	return nil
 }

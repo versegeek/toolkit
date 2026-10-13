@@ -1,145 +1,97 @@
-// Package http provides a Gin HTTP server RunProvider.
+// Package http provides a Gin HTTP server as a run provider.
 //
-// Standalone usage (Pattern A, no Wire):
+// Register routes on Router after Init and before Run:
 //
-//	c := container.New()
-//	c.MustInit(http.New(nil))
-//	// Register routes on the server before MustRun:
-//	// server := http.New(nil); c.MustInit(server); server.Router.GET("/", handler)
-//	c.MustRun()
+//	srv := http.New(nil)
+//	g.MustInit(srv)
+//	srv.Router.GET("/ping", ping)
+//	g.MustRun()
 //
-// Wire usage (Pattern B) – add http.ProviderSet to wire.Build():
-//
-//	wire.Build(http.NewConfigFromEnv, http.NewServer, ...)
+// With Wire, add ProviderSet to the injector and register the routes in the
+// constructor that receives the *Server.
 package http
 
 import (
-	"context"
+	"errors"
 	"fmt"
-	"net"
 	nethttp "net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
+	"github.com/google/wire"
+
+	"github.com/versegeek/toolkit/internal/httpserver"
 	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Server.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewServer)
 
-// Config holds HTTP server parameters.
-type Config struct {
-	Host            string
-	Port            int
-	Mode            string        // gin mode: debug | release | test
-	ShutdownTimeout time.Duration // graceful shutdown timeout
-}
-
-const (
-	defaultHost            = ""
-	defaultPort            = 8080
-	defaultMode            = "release"
-	defaultShutdownTimeout = 5 * time.Second
-)
-
-// NewConfigFromEnv reads HTTP server configuration from the environment.
-// Keys: HTTP_HOST, HTTP_PORT, HTTP_MODE, HTTP_SHUTDOWN_TIMEOUT.
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("HTTP_HOST", defaultHost)
-	v.SetDefault("HTTP_PORT", defaultPort)
-	v.SetDefault("HTTP_MODE", defaultMode)
-	v.SetDefault("HTTP_SHUTDOWN_TIMEOUT", defaultShutdownTimeout)
-
-	cfg := &Config{
-		Host:            v.GetString("HTTP_HOST"),
-		Port:            v.GetInt("HTTP_PORT"),
-		Mode:            v.GetString("HTTP_MODE"),
-		ShutdownTimeout: v.GetDuration("HTTP_SHUTDOWN_TIMEOUT"),
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"host": cfg.Host,
-		"port": cfg.Port,
-		"mode": cfg.Mode,
-	}).Debug("HTTP server config loaded")
-
-	return cfg
-}
-
-// ─── Server ───────────────────────────────────────────────────────────────────
-
-// Server wraps a Gin engine as a lifecycle-managed RunProvider.
-// Register routes on Router after Init() and before the Container starts.
+// Server is a Gin HTTP server managed as a run provider.
 type Server struct {
 	provider.AbstractRunProvider
 
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
 	Config *Config
+	// Router receives routes and middleware. Init creates it.
 	Router *gin.Engine
-	srv    *nethttp.Server
+
+	srv *nethttp.Server
 }
 
 var _ provider.RunProvider = (*Server)(nil)
 
-// New creates a Server without initialising Gin.
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Server that is not initialised yet.
 func New(cfg *Config) *Server {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Server{Config: cfg}
 }
 
-// NewServer is the Wire-compatible constructor.
+// NewServer returns an initialised Server and a cleanup that closes it.
 func NewServer(cfg *Config) (*Server, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Init sets the Gin mode, creates the engine, and prepares the http.Server.
+// Init creates the Gin engine with panic recovery and prepares the server.
 func (s *Server) Init() error {
+	if s.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		s.Config = cfg
+	}
+	switch s.Config.Mode {
+	case gin.DebugMode, gin.ReleaseMode, gin.TestMode:
+	default:
+		return fmt.Errorf("http: invalid mode %q: want debug, release or test", s.Config.Mode)
+	}
+
 	gin.SetMode(s.Config.Mode)
 	s.Router = gin.New()
 	s.Router.Use(gin.Recovery())
-
-	addr := fmt.Sprintf("%s:%d", s.Config.Host, s.Config.Port)
-	s.srv = &nethttp.Server{Addr: addr, Handler: s.Router}
+	s.srv = httpserver.New(s.Config.addr(), s.Router)
 	return nil
 }
 
-// Run binds the TCP port and starts serving. Blocks until stopped via Close().
-// SetRunning(true) is called only after the port is successfully bound.
+// Run listens on the configured address and serves until Close.
 func (s *Server) Run() error {
-	ln, err := net.Listen("tcp", s.srv.Addr)
-	if err != nil {
-		return fmt.Errorf("http: listen on %s failed: %w", s.srv.Addr, err)
+	if s.srv == nil {
+		return errors.New("http: run failed: server is not initialized")
 	}
-
-	logrus.WithField("addr", s.srv.Addr).Info("HTTP server starting")
-	s.SetRunning(true)
-
-	if err := s.srv.Serve(ln); err != nethttp.ErrServerClosed {
-		return err
+	if err := httpserver.Serve(s.srv, s.SetRunning); err != nil {
+		return fmt.Errorf("http: serve failed: %w", err)
 	}
 	return nil
 }
 
-// Close gracefully shuts down the HTTP server, waiting up to ShutdownTimeout
-// for in-flight requests to complete.
+// Close shuts the server down gracefully within Config.ShutdownTimeout.
 func (s *Server) Close() error {
 	if s.srv == nil {
-		return s.AbstractRunProvider.Close()
+		return nil
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), s.Config.ShutdownTimeout)
-	defer cancel()
-
-	if err := s.srv.Shutdown(ctx); err != nil {
-		logrus.WithError(err).Warn("HTTP server shutdown error")
+	if err := httpserver.Shutdown(s.srv, s.Config.ShutdownTimeout); err != nil {
+		return fmt.Errorf("http: shutdown failed: %w", err)
 	}
-
-	return s.AbstractRunProvider.Close()
+	return nil
 }
