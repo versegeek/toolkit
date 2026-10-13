@@ -9,12 +9,13 @@ package main
 import (
 	"github.com/versegeek/toolkit/cache/redis"
 	"github.com/versegeek/toolkit/log/zap"
+	"github.com/versegeek/toolkit/server/http"
 )
 
 // Injectors from wire.go:
 
-// InitApp wires all providers together and returns the assembled App.
-// The returned cleanup function closes all providers in reverse order.
+// InitApp builds and initialises the providers in dependency order and
+// returns a cleanup that closes them in reverse order.
 func InitApp() (*App, func(), error) {
 	config, err := zap.NewConfigFromEnv()
 	if err != nil {
@@ -34,8 +35,21 @@ func InitApp() (*App, func(), error) {
 		cleanup()
 		return nil, nil, err
 	}
-	app := NewApp(client, redisClient)
+	httpConfig, err := http.NewConfigFromEnv()
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	server, cleanup3, err := http.NewServer(httpConfig)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	app := NewApp(client, redisClient, server)
 	return app, func() {
+		cleanup3()
 		cleanup2()
 		cleanup()
 	}, nil

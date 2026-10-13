@@ -2,153 +2,170 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/versegeek/toolkit.svg)](https://pkg.go.dev/github.com/versegeek/toolkit)
 [![CI](https://github.com/versegeek/toolkit/actions/workflows/ci.yaml/badge.svg)](https://github.com/versegeek/toolkit/actions/workflows/ci.yaml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/versegeek/toolkit)](https://goreportcard.com/report/github.com/versegeek/toolkit)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A **lifecycle-managed provider library** for Go. Every integration (database, cache, message queue, tracing …) is an independent, zero-dependency provider that you wire together on demand — no monolithic init, no hidden globals.
+Lifecycle-managed providers for Go services (databases, caches, message queues, servers, logging, tracing and auth) that you compose by hand or with [Google Wire](https://github.com/google/wire).
+
+> :construction: Under development: APIs may change until v1.
 
 ## Features
 
-- **On-demand loading** — only the providers you register are initialised
-- **LIFO shutdown** — `MustClose()` tears down providers in reverse-init order automatically
-- **Two composition patterns** — lightweight Container (no codegen) or Google Wire (compile-time DI)
-- **Race-free** — all providers are tested with `-race`
-- **Pure-Go SQLite** — no CGo required for SQLite drivers
+- **One shape for every provider**: `New` does no I/O, `Init` connects, run providers `Run` in the foreground, `Close` releases. A failed `Init` leaves nothing open.
+- **Ordered lifecycle**: run providers start only after everything is initialised; SIGINT, SIGTERM or a failing run provider shuts everything down once, in reverse order.
+- **With or without Wire**: every provider package exports a `ProviderSet`; `lifecycle.Group` covers the hand-written case.
+- **Configuration that fails loudly**: environment variables or `config.yaml`; a malformed file is an error, not silently ignored.
+- **One log stream**: the toolkit logs through `log/slog`, and the zap and logrus providers route it into their backend.
+- **Pure-Go SQLite**: no cgo.
 
-## Provider Catalog
+## Providers
 
-| Category | Package | Description |
-|----------|---------|-------------|
-| **Database** | `db/gorm` | GORM ORM — SQLite / MySQL / PostgreSQL / ClickHouse |
-| | `db/ent` | ent ORM — SQLite / MySQL / PostgreSQL |
-| | `db/clickhouse` | Native ClickHouse client (`clickhouse-go/v2`) |
-| | `db/mongo` | MongoDB client |
-| **Cache** | `cache/redis` | Redis single-node + Cluster |
-| **Message Queue** | `mq/rabbitmq` | RabbitMQ (AMQP 0-9-1) |
-| | `mq/nats` | NATS core + JetStream |
-| | `mq/nsq` | NSQ producer |
-| **Server** | `server/http` | Gin HTTP server with graceful shutdown |
-| | `server/grpc` | gRPC server with health + reflection |
-| | `server/pprof` | pprof debug server |
-| | `server/prometheus` | Prometheus metrics server |
-| **Logging** | `log/logrus` | logrus — configures global logger |
-| | `log/zap` | zap — high-performance structured logger |
-| **Tracing** | `trace/otel` | OpenTelemetry — OTLP / Zipkin / stdout |
-| **Auth** | `auth/oauth2` | OAuth2 Authorization Code + Client Credentials |
-| **Utils** | `utils` | UUID helpers |
+| Package | Provides | Config keys |
+|---------|----------|-------------|
+| `cache/redis` | go-redis client and cluster client | `REDIS_*` |
+| `db/gorm` | GORM for MySQL, PostgreSQL, SQLite and ClickHouse | `DB_*` |
+| `db/ent` | ent SQL driver for MySQL, PostgreSQL and SQLite | `DB_*` |
+| `db/clickhouse` | Native ClickHouse connection | `CLICKHOUSE_*` |
+| `db/mongo` | MongoDB client (driver v2) | `MONGODB_*` |
+| `mq/rabbitmq` | RabbitMQ (AMQP 0-9-1) connection | `RABBITMQ_*` |
+| `mq/nats` | NATS connection, optional JetStream | `NATS_*` |
+| `mq/nsq` | NSQ producer | `NSQ_*` |
+| `server/http` | Gin HTTP server | `HTTP_*` |
+| `server/grpc` | gRPC server with health and reflection | `GRPC_*` |
+| `server/pprof` | pprof endpoints, on 127.0.0.1 by default | `PPROF_*` |
+| `server/prometheus` | Prometheus metrics endpoint | `PROMETHEUS_*` |
+| `log/zap` | zap logger, installed as `zap.L` and the slog default | `ZAP_*` |
+| `log/logrus` | logrus standard logger, installed as the slog default | `LOGRUS_*` |
+| `trace/otel` | OpenTelemetry tracing over OTLP/HTTP or stdout | `TRACE_*` |
+| `auth/oauth2` | OAuth2 authorization code and client credentials flows | `OAUTH2_*` |
+
+Each package documents its keys and defaults on its `NewConfigFromEnv`. The supporting packages are `provider` (the interfaces), `lifecycle` (start-up and shutdown), `config` (Viper loading) and `utils`.
 
 ## Installation
 
 ```bash
-go get github.com/versegeek/toolkit
+go get github.com/versegeek/toolkit@latest
 ```
 
-Import only the providers you need:
+Requires Go 1.25 or later. Your binary only contains the providers you import.
 
-```bash
-go get github.com/versegeek/toolkit/cache/redis
-go get github.com/versegeek/toolkit/db/gorm
-```
+## Usage
 
-## Quick Start
-
-### Pattern A — Container (no code generation)
-
-Suitable for simple services or scripts where you want explicit control.
+### Manual composition
 
 ```go
 package main
 
 import (
-    "github.com/versegeek/toolkit/container"
-    "github.com/versegeek/toolkit/cache/redis"
-    "github.com/versegeek/toolkit/db/gorm"
-    "github.com/versegeek/toolkit/server/http"
+	"github.com/gin-gonic/gin"
+
+	"github.com/versegeek/toolkit/cache/redis"
+	"github.com/versegeek/toolkit/lifecycle"
+	zaplog "github.com/versegeek/toolkit/log/zap"
+	"github.com/versegeek/toolkit/server/http"
 )
 
 func main() {
-    c := container.New()
+	g := lifecycle.New()
+	defer g.MustClose() // releases what was initialised if a later MustInit panics
 
-    // Providers are initialised in registration order.
-    c.MustInit(redis.New(nil))   // nil → reads from env / config.yaml
-    c.MustInit(gorm.New(nil))
+	g.MustInit(zaplog.New(nil)) // nil config: read from the environment in Init
+	rdb := redis.New(nil)
+	g.MustInit(rdb)
+	srv := http.New(nil)
+	g.MustInit(srv)
 
-    srv := http.New(nil)
-    c.MustInit(srv)
+	// Register routes after Init and before Run.
+	srv.Router.GET("/ping", func(c *gin.Context) {
+		c.JSON(200, gin.H{"pings": rdb.Client().Incr(c, "pings").Val()})
+	})
 
-    // Register routes after Init, before Run.
-    srv.Router.GET("/ping", func(ctx *gin.Context) {
-        ctx.JSON(200, gin.H{"message": "pong"})
-    })
-
-    // MustRun starts RunProviders and blocks until SIGINT/SIGTERM.
-    // MustClose is called automatically in LIFO order on shutdown.
-    defer c.MustClose()
-    c.MustRun()
+	g.MustRun() // serves until SIGINT/SIGTERM, then closes http, redis, zap
 }
 ```
 
-### Pattern B — Google Wire (compile-time DI)
+Full example: [`examples/group`](examples/group).
 
-Suitable for larger services where you want compile-time verification.
+### Wire composition
+
+Wire builds and initialises the providers; `lifecycle.Run` runs the servers and calls Wire's cleanup exactly once.
 
 ```go
-// cmd/wire.go  (build tag: wireinject)
 //go:build wireinject
 
 package main
 
-import (
-    "github.com/google/wire"
-    "github.com/versegeek/toolkit/cache/redis"
-    "github.com/versegeek/toolkit/db/gorm"
-)
-
 func InitApp() (*App, func(), error) {
-    wire.Build(
-        redis.ProviderSet,
-        gorm.ProviderSet,
-        NewApp,
-    )
-    return nil, nil, nil
+	panic(wire.Build(zaplog.ProviderSet, redis.ProviderSet, http.ProviderSet, NewApp))
 }
 ```
 
 ```go
-// main.go
+// NewApp receives initialised providers; register routes here.
+func NewApp(logger *zaplog.Client, rdb *redis.Client, srv *http.Server) *App {
+	srv.Router.GET("/ping", func(c *gin.Context) { c.String(200, "pong") })
+	return &App{Log: logger, Redis: rdb, HTTP: srv}
+}
+
 func main() {
-    app, cleanup, err := InitApp()
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer cleanup()
-    container.HandleSignals(cleanup) // blocks until signal
+	app, cleanup, err := InitApp()
+	if err != nil {
+		log.Fatalf("init: %v", err)
+	}
+	if err := lifecycle.Run(context.Background(), cleanup, app.HTTP); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
-Generate the wiring: `make wire`
+Generate `wire_gen.go` with `make wire`. Full example: [`examples/wire`](examples/wire).
 
 ## Configuration
 
-Every provider reads its configuration from environment variables (or a `config.yaml` / `configs/config.yaml` file). Environment variables always take precedence.
+- Each provider reads environment variables and an optional `config.yaml` from `.`, `./config` or `./configs`; environment variables win.
+- Pass a `Config` to skip the environment: `redis.New(&redis.Config{Addrs: []string{"localhost:6379"}})`.
+- With `New(nil)` the configuration is loaded in `Init`, so configuration errors surface there.
+- List values such as `REDIS_ADDRESS` (for a cluster) or `ZAP_OUTPUT` are comma-separated.
+- `db/gorm` and `db/ent` share the `DB_*` keys and require `DB_DRIVER` (`mysql`, `postgres`, `sqlite` or `clickhouse`).
 
 ```yaml
 # config.yaml
 REDIS_ADDRESS: "localhost:6379"
-
-DB_DRIVER: "sqlite"          # sqlite | mysql | postgres | clickhouse
-MYSQL_DSN: ""                # leave empty to use individual host/port/db fields
-
-TRACE_SERVICE_NAME: "my-service"
-TRACE_EXPORTER: "otlp"       # otlp | zipkin | stdout
-TRACE_OTLP_ENDPOINT: "http://localhost:4318"
-
+DB_DRIVER: "postgres"
+DB_HOST: "localhost"
+DB_DATABASE: "app"
+HTTP_PORT: 8080
+TRACE_SERVICE_NAME: "orders"
 ZAP_LEVEL: "info"
-ZAP_ENCODING: "json"
 ```
 
-See each provider package's `NewConfigFromEnv()` function for the full list of supported keys.
+## Writing a provider
 
-## Contributing
+A provider implements `provider.Provider`, and a run provider also implements `provider.RunProvider`:
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how to add new providers, coding conventions, and the PR checklist.
+- `New(cfg)` stores the config and does no I/O.
+- `Init` loads the config when it is nil, connects, and closes whatever it opened before returning an error.
+- `Close` is safe before or after a failed `Init`. A run provider's `Close` makes `Run` return and may be called twice.
+- Implement `provider.Enabler` if configuration can switch the provider off.
+- Export `NewClient` (or `NewServer`) as `provider.InitProvider(New(cfg))` and a `ProviderSet`.
+
+Terms are defined in [GLOSSARY.md](GLOSSARY.md) and the design decisions in [docs/adr](docs/adr).
+
+## Migrating from the `pkg/` layout
+
+| Before (`36c39b3`) | Now |
+|--------------------|-----|
+| `pkg/stack.New()` | `lifecycle.New()`; `MustInit`, `MustRun` and `MustClose` are unchanged |
+| `pkg/provider` | `provider`; `Enabled()` is now the optional `provider.Enabler` interface |
+| `pkg/common.LoadFromFile(v)` | `config.LoadFromFile(v)`, which also reads environment variables and returns an error |
+| `pkg/provider/redis` | `cache/redis`; `Config.Address` became `Config.Addrs` |
+| `pkg/provider/gorm` (MySQL) | `db/gorm` with `DB_DRIVER=mysql`; `MYSQL_*` keys became `DB_*` |
+
+## Development
+
+```bash
+make build        # go build ./...
+make test         # go test -race ./...
+make lint         # go fmt, go vet, golangci-lint
+make wire         # regenerate wire_gen.go in examples/wire
+make wire-check   # fail if wire_gen.go is stale
+make tidy         # go mod tidy
+```
