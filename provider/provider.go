@@ -1,117 +1,83 @@
-// Package provider defines the core interfaces for composable application
-// components.
+// Package provider defines the building blocks the toolkit manages.
 //
-// Lifecycle of a Provider:
+// A provider owns one external resource or service. It is initialised, used
+// and closed; a run provider also works in the foreground between Init and
+// Close:
 //
-//	New()           → struct created, not connected
-//	Init()          → connections opened, pool ready
-//	go Run() [opt]  → background service started (RunProvider only)
-//	...
-//	Close()         → connections closed, resources released
+//	New → Init → [Run] → Close
 //
-// A Container (package container) manages Init/Run/Close in the correct order.
-// Alternatively, wire the providers manually and call Init() yourself via InitProvider.
+// Package lifecycle drives these steps, either through a lifecycle.Group or
+// through lifecycle.Run together with a Wire injector.
 package provider
 
-import (
-	"fmt"
-	"reflect"
-	"sync/atomic"
+import "sync/atomic"
 
-	"github.com/sirupsen/logrus"
-)
-
-// Provider is the base interface every component must implement.
+// Provider is a component that owns an external resource or service.
+//
+// Init opens connections or prepares resources. When it fails it must release
+// anything it opened before returning the error. Close releases the resources
+// and must be safe to call when Init was never called or failed.
 type Provider interface {
-	// Init establishes connections and prepares resources.
-	// Called once before the component is used.
 	Init() error
-
-	// Close releases resources. Called in reverse order on shutdown.
 	Close() error
 }
 
-// RunProvider extends Provider with a blocking Run method.
-// Implement this for long-running services (HTTP/gRPC servers, consumers, etc.).
+// RunProvider is a Provider that also works in the foreground, such as an
+// HTTP or gRPC server.
 //
-// The Container's MustRun starts each RunProvider in its own goroutine
-// after all Init() calls succeed.
+// Run blocks until the provider stops and returns nil when Close stopped it.
+// Close must make Run return and must be safe to call more than once.
+// IsRunning reports whether Run has reached its steady state, for example
+// whether the listener is bound.
 type RunProvider interface {
 	Provider
-
-	// Run must block until the service stops (Shutdown, signal, error).
-	// Return nil on clean shutdown, non-nil on unexpected failure.
 	Run() error
-
-	// IsRunning reports true after Run() has entered its steady state
-	// (e.g. the HTTP server is listening). Call SetRunning(true) once ready.
 	IsRunning() bool
 }
 
-// ─── Abstract base types ──────────────────────────────────────────────────────
+// Enabler is implemented by providers that configuration can switch off.
+//
+// Enabled is checked before Init and again before Run; a provider that
+// reports false is skipped at that step. A provider whose configuration is
+// only loaded in Init should report true until then.
+type Enabler interface {
+	Enabled() bool
+}
 
-// AbstractProvider is an embeddable no-op Provider.
-// Embed it and override only the methods you need.
+// IsEnabled reports whether p is enabled. Providers that do not implement
+// Enabler are always enabled.
+func IsEnabled(p Provider) bool {
+	e, ok := p.(Enabler)
+	return !ok || e.Enabled()
+}
+
+// AbstractProvider is an embeddable Provider whose Init and Close do nothing.
 type AbstractProvider struct{}
 
-func (p *AbstractProvider) Init() error  { return nil }
-func (p *AbstractProvider) Close() error { return nil }
+// Init does nothing.
+func (*AbstractProvider) Init() error { return nil }
 
-// AbstractRunProvider is an embeddable base for RunProvider.
-// Call SetRunning(true) at the start of Run() once the service is ready.
+// Close does nothing.
+func (*AbstractProvider) Close() error { return nil }
+
+// AbstractRunProvider is an embeddable base for run providers that tracks
+// whether Run is in its steady state. Call SetRunning(true) once Run is ready
+// and SetRunning(false) when it returns.
 type AbstractRunProvider struct {
 	running atomic.Bool
 }
 
-func (p *AbstractRunProvider) Init() error { return nil }
+// Init does nothing.
+func (*AbstractRunProvider) Init() error { return nil }
+
+// Close marks the provider as not running.
 func (p *AbstractRunProvider) Close() error {
 	p.running.Store(false)
 	return nil
 }
-func (p *AbstractRunProvider) IsRunning() bool   { return p.running.Load() }
-func (p *AbstractRunProvider) SetRunning(v bool) { p.running.Store(v) }
 
-// ─── Init helper ──────────────────────────────────────────────────────────────
+// IsRunning reports whether the provider is running.
+func (p *AbstractRunProvider) IsRunning() bool { return p.running.Load() }
 
-// InitProvider calls p.Init() and returns (p, cleanup, nil) on success,
-// or (p, nil, error) on failure. The returned cleanup calls p.Close().
-//
-// Use this in Wire-compatible constructors:
-//
-//	func NewClient(cfg *Config) (*Client, func(), error) {
-//	    return provider.InitProvider(New(cfg))
-//	}
-//
-// InitProvider does NOT start RunProvider goroutines. The Container's
-// MustRun is solely responsible for launching goroutines.
-func InitProvider[T Provider](p T) (T, func(), error) {
-	name := Name(p)
-
-	logrus.Debugf("%s initializing...", name)
-	if err := p.Init(); err != nil {
-		return p, nil, fmt.Errorf("%s init failed: %w", name, err)
-	}
-	logrus.Infof("%s initialized", name)
-
-	cleanup := func() {
-		logrus.Debugf("%s closing...", name)
-		if err := p.Close(); err != nil {
-			logrus.WithError(err).Warnf("%s close failed", name)
-		} else {
-			logrus.Debugf("%s closed", name)
-		}
-	}
-
-	return p, cleanup, nil
-}
-
-// ─── Utilities ────────────────────────────────────────────────────────────────
-
-// Name returns the fully-qualified type name of p (e.g. "redis.Client").
-func Name(p any) string {
-	t := reflect.TypeOf(p)
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	return t.String()
-}
+// SetRunning records whether the provider is running.
+func (p *AbstractRunProvider) SetRunning(running bool) { p.running.Store(running) }

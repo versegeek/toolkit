@@ -23,7 +23,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/internal/config"
+	"github.com/versegeek/toolkit/config"
 	"github.com/versegeek/toolkit/provider"
 )
 

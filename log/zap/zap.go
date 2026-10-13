@@ -19,7 +19,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/internal/config"
+	"github.com/versegeek/toolkit/config"
 	"github.com/versegeek/toolkit/provider"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"

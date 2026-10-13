@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/internal/config"
+	"github.com/versegeek/toolkit/config"
 	"github.com/versegeek/toolkit/provider"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
