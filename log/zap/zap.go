@@ -12,8 +12,9 @@ package zap
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
-	"syscall"
+	"os"
 
 	"github.com/google/wire"
 	uberzap "go.uber.org/zap"
@@ -111,9 +112,25 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.restore()
-	// Syncing a terminal or pipe fails with ENOTTY or EINVAL; that is harmless.
-	if err := c.logger.Sync(); err != nil && !errors.Is(err, syscall.ENOTTY) && !errors.Is(err, syscall.EINVAL) {
+	if err := c.logger.Sync(); err != nil && !onlyConsoleSyncErrors(err) {
 		return fmt.Errorf("zap: sync failed: %w", err)
 	}
 	return nil
+}
+
+// onlyConsoleSyncErrors reports whether err only holds failures to sync
+// stdout or stderr. Terminals and pipes do not support fsync and fail with a
+// platform-dependent error (ENOTTY, EINVAL or EBADF), which is harmless.
+func onlyConsoleSyncErrors(err error) bool {
+	errs := []error{err}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs = joined.Unwrap()
+	}
+	for _, e := range errs {
+		var pathErr *fs.PathError
+		if !errors.As(e, &pathErr) || (pathErr.Path != os.Stdout.Name() && pathErr.Path != os.Stderr.Name()) {
+			return false
+		}
+	}
+	return true
 }
