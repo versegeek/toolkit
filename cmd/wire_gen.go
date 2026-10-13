@@ -21,7 +21,11 @@ func InitApp() (*App, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	redisConfig := redis.NewConfigFromEnv()
+	redisConfig, err := redis.NewConfigFromEnv()
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
 	redisClient, cleanup2, err := redis.NewClient(redisConfig)
 	if err != nil {
 		cleanup()

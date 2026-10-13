@@ -1,150 +1,99 @@
-// Package redis provides a Redis client Provider.
+// Package redis provides go-redis clients as providers: Client for a single
+// server and ClusterClient for a Redis Cluster.
 //
-// Standalone usage (Pattern A, no Wire):
-//
-//	c := container.New()
-//	c.MustInit(redis.New(nil))  // nil → reads from env/config.yaml
-//	c.MustRun()
-//
-// Wire usage (Pattern B) – add redis.ProviderSet to wire.Build():
-//
-//	wire.Build(redis.NewConfigFromEnv, redis.NewClient, ...)
+//	rdb := redis.New(nil)
+//	g.MustInit(rdb)
+//	err := rdb.Client().Set(ctx, "key", "value", 0).Err()
 package redis
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
+	"github.com/google/wire"
 	"github.com/redis/go-redis/v9"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
+
 	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Client.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewClient)
 
-// Config holds the Redis connection parameters.
-type Config struct {
-	Address      string
-	DB           int
-	Username     string
-	Password     string
-	PoolSize     int
-	MinIdleConns int
-	MaxRetries   int
-	DialTimeout  time.Duration
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-}
+// pingTimeout bounds the connectivity check in Init, retries included.
+const pingTimeout = 10 * time.Second
 
-const (
-	defaultAddress      = "127.0.0.1:6379"
-	defaultDB           = 0
-	defaultUsername     = ""
-	defaultPassword     = ""
-	defaultPoolSize     = 50
-	defaultMinIdleConns = 5
-	defaultMaxRetries   = 3
-)
-
-var (
-	defaultDialTimeout  = 3 * time.Second
-	defaultReadTimeout  = 5 * time.Second
-	defaultWriteTimeout = 5 * time.Second
-)
-
-// NewConfigFromEnv reads Redis configuration from environment variables
-// (or a config.yaml file). All keys are prefixed with REDIS_.
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("REDIS_ADDRESS", defaultAddress)
-	v.SetDefault("REDIS_DB", defaultDB)
-	v.SetDefault("REDIS_USERNAME", defaultUsername)
-	v.SetDefault("REDIS_PASSWORD", defaultPassword)
-	v.SetDefault("REDIS_POOL_SIZE", defaultPoolSize)
-	v.SetDefault("REDIS_MIN_IDLE_CONNS", defaultMinIdleConns)
-	v.SetDefault("REDIS_MAX_RETRIES", defaultMaxRetries)
-	v.SetDefault("REDIS_DIAL_TIMEOUT", defaultDialTimeout)
-	v.SetDefault("REDIS_READ_TIMEOUT", defaultReadTimeout)
-	v.SetDefault("REDIS_WRITE_TIMEOUT", defaultWriteTimeout)
-
-	cfg := &Config{
-		Address:      v.GetString("REDIS_ADDRESS"),
-		DB:           v.GetInt("REDIS_DB"),
-		Username:     v.GetString("REDIS_USERNAME"),
-		Password:     v.GetString("REDIS_PASSWORD"),
-		PoolSize:     v.GetInt("REDIS_POOL_SIZE"),
-		MinIdleConns: v.GetInt("REDIS_MIN_IDLE_CONNS"),
-		MaxRetries:   v.GetInt("REDIS_MAX_RETRIES"),
-		DialTimeout:  v.GetDuration("REDIS_DIAL_TIMEOUT"),
-		ReadTimeout:  v.GetDuration("REDIS_READ_TIMEOUT"),
-		WriteTimeout: v.GetDuration("REDIS_WRITE_TIMEOUT"),
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"address":  cfg.Address,
-		"db":       cfg.DB,
-		"poolSize": cfg.PoolSize,
-	}).Debug("Redis config loaded")
-
-	return cfg
-}
-
-// ─── Client ───────────────────────────────────────────────────────────────────
-
-// Client wraps a go-redis client as a lifecycle-managed Provider.
+// Client is a single-server Redis client managed as a provider.
 type Client struct {
-	provider.AbstractProvider
-
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
 	Config *Config
+
 	client *redis.Client
 }
 
-// Ensure compile-time interface satisfaction.
 var _ provider.Provider = (*Client)(nil)
 
-// New creates a Client (does not connect yet).
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Client that is not connected yet.
 func New(cfg *Config) *Client {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Client{Config: cfg}
 }
 
-// NewClient is the Wire-compatible constructor.
+// NewClient returns a connected Client and a cleanup that closes it.
 func NewClient(cfg *Config) (*Client, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Client returns the underlying *redis.Client. Only valid after Init().
-func (c *Client) Client() *redis.Client { return c.client }
+// Client returns the go-redis client. It is nil before Init.
+func (c *Client) Client() *redis.Client {
+	return c.client
+}
 
-// Init creates and pings the Redis connection.
+// Init connects and checks connectivity with a PING.
 func (c *Client) Init() error {
-	c.client = redis.NewClient(&redis.Options{
-		Addr:         c.Config.Address,
+	if c.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		c.Config = cfg
+	}
+	if n := len(c.Config.Addrs); n != 1 {
+		return fmt.Errorf("redis: Client needs exactly one address, got %d (use ClusterClient for a cluster)", n)
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:         c.Config.Addrs[0],
+		DB:           c.Config.DB,
 		Username:     c.Config.Username,
 		Password:     c.Config.Password,
-		DB:           c.Config.DB,
+		PoolSize:     c.Config.PoolSize,
+		MinIdleConns: c.Config.MinIdleConns,
 		MaxRetries:   c.Config.MaxRetries,
 		DialTimeout:  c.Config.DialTimeout,
 		ReadTimeout:  c.Config.ReadTimeout,
 		WriteTimeout: c.Config.WriteTimeout,
-		PoolSize:     c.Config.PoolSize,
-		MinIdleConns: c.Config.MinIdleConns,
 	})
+	if err := ping(client); err != nil {
+		return errors.Join(fmt.Errorf("redis: ping %s failed: %w", c.Config.Addrs[0], err), client.Close())
+	}
 
-	return c.client.Ping(context.Background()).Err()
+	c.client = client
+	return nil
 }
 
-// Close releases the Redis connection.
+// Close closes the client.
 func (c *Client) Close() error {
 	if c.client == nil {
 		return nil
 	}
 	return c.client.Close()
+}
+
+func ping(client redis.UniversalClient) error {
+	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+	defer cancel()
+	return client.Ping(ctx).Err()
 }

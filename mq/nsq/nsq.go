@@ -1,136 +1,95 @@
-// Package nsq provides an NSQ producer Provider.
+// Package nsq provides an NSQ producer as a provider.
 //
-// NSQ separates publishing (Producer → nsqd) from consuming
-// (Consumer → lookupd/nsqd). This package manages the Producer lifecycle.
-// Consumers are topic+channel specific; create them directly using the
-// LookupdAddresses from Config:
+// Consumers are bound to a topic and channel, so applications create them
+// directly, using the lookupd addresses from the same configuration:
 //
-//	consumer, _ := gonsq.NewConsumer("topic", "channel", gonsq.NewConfig())
-//	consumer.ConnectToNSQLookupds(client.Config.LookupdAddresses)
+//	p := nsq.New(nil)
+//	g.MustInit(p)
+//	err := p.Producer().Publish("orders", data)
 //
-// Standalone usage (Pattern A, no Wire):
-//
-//	c := container.New()
-//	c.MustInit(nsq.New(nil))  // nil → reads from env/config.yaml
-//	c.MustRun()
-//
-// Wire usage (Pattern B) – add nsq.ProviderSet to wire.Build():
-//
-//	wire.Build(nsq.NewConfigFromEnv, nsq.NewClient, ...)
+//	consumer, _ := gonsq.NewConsumer("orders", "billing", gonsq.NewConfig())
+//	err = consumer.ConnectToNSQLookupds(p.Config.LookupdAddresses)
 package nsq
 
 import (
 	"fmt"
-	"strings"
+	"log/slog"
 
+	"github.com/google/wire"
 	gonsq "github.com/nsqio/go-nsq"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
+
 	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Client.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewClient)
 
-// Config holds NSQ connection parameters.
-type Config struct {
-	// NsqdAddress is the nsqd TCP address for the Producer (host:port).
-	NsqdAddress string
-
-	// LookupdAddresses are the nsqlookupd HTTP addresses used for consumers.
-	// Stored here for convenience; use when constructing gonsq.Consumer directly.
-	LookupdAddresses []string
-}
-
-const defaultNsqdAddress = "127.0.0.1:4150"
-
-// NewConfigFromEnv reads NSQ configuration from the environment.
-//
-//   - NSQ_NSQD_ADDRESS:      nsqd address for the producer (default 127.0.0.1:4150)
-//   - NSQ_LOOKUPD_ADDRESSES: comma-separated list of nsqlookupd HTTP addresses
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("NSQ_NSQD_ADDRESS", defaultNsqdAddress)
-	v.SetDefault("NSQ_LOOKUPD_ADDRESSES", "")
-
-	cfg := &Config{
-		NsqdAddress:      v.GetString("NSQ_NSQD_ADDRESS"),
-		LookupdAddresses: splitCSV(v.GetString("NSQ_LOOKUPD_ADDRESSES")),
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"nsqd":    cfg.NsqdAddress,
-		"lookupd": cfg.LookupdAddresses,
-	}).Debug("NSQ config loaded")
-
-	return cfg
-}
-
-// splitCSV splits a comma-separated string into a trimmed slice.
-func splitCSV(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			result = append(result, t)
-		}
-	}
-	return result
-}
-
-// ─── Client ───────────────────────────────────────────────────────────────────
-
-// Client wraps an *nsq.Producer as a lifecycle-managed Provider.
+// Client is an NSQ producer managed as a provider.
 type Client struct {
-	provider.AbstractProvider
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
+	Config *Config
 
-	Config   *Config
 	producer *gonsq.Producer
 }
 
 var _ provider.Provider = (*Client)(nil)
 
-// New creates a Client without connecting.
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Client that is not connected yet.
 func New(cfg *Config) *Client {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Client{Config: cfg}
 }
 
-// NewClient is the Wire-compatible constructor.
+// NewClient returns a connected Client and a cleanup that closes it.
 func NewClient(cfg *Config) (*Client, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Producer returns the underlying *nsq.Producer. Only valid after Init().
-func (c *Client) Producer() *gonsq.Producer { return c.producer }
+// Producer returns the NSQ producer. It is nil before Init.
+func (c *Client) Producer() *gonsq.Producer {
+	return c.producer
+}
 
-// Init creates the NSQ producer and pings nsqd.
+// Init creates the producer, routes its warnings and errors to slog, and
+// checks that nsqd is reachable.
 func (c *Client) Init() error {
+	if c.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		c.Config = cfg
+	}
+
 	p, err := gonsq.NewProducer(c.Config.NsqdAddress, gonsq.NewConfig())
 	if err != nil {
-		return fmt.Errorf("nsq: failed to create producer: %w", err)
+		return fmt.Errorf("nsq: create producer failed: %w", err)
 	}
+	p.SetLogger(slogWriter{}, gonsq.LogLevelWarning)
 	if err := p.Ping(); err != nil {
-		p.Stop() // clean up router goroutine started by NewProducer/connect
-		return fmt.Errorf("nsq: failed to ping nsqd at %s: %w", c.Config.NsqdAddress, err)
+		p.Stop()
+		return fmt.Errorf("nsq: ping nsqd at %s failed: %w", c.Config.NsqdAddress, err)
 	}
+
 	c.producer = p
 	return nil
 }
 
-// Close stops the NSQ producer.
+// Close stops the producer after its in-flight publishes complete.
 func (c *Client) Close() error {
 	if c.producer == nil {
 		return nil
 	}
 	c.producer.Stop()
+	return nil
+}
+
+// slogWriter forwards go-nsq log lines, already filtered to warnings and
+// errors, to slog.
+type slogWriter struct{}
+
+func (slogWriter) Output(_ int, s string) error {
+	slog.Warn(s, "component", "nsq")
 	return nil
 }
