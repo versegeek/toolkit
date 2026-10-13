@@ -1,63 +1,79 @@
 name: CI
 
 on:
-#  pull_request:
-#  push:
-#    branches:
-#      - main
-#      - master
-#      - 'releases/**'
-#      - 'releases'
-  workflow_dispatch: { }
+  push:
+    branches:
+      - main
+      - master
+      - 'releases/**'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: {}
 
 jobs:
 
   lint:
-    name: Golang-CI Lint
+    name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      matrix:
-        platform: [ubuntu-latest]
     steps:
-      - uses: actions/checkout@v2
-      - uses: golangci/golangci-lint-action@v2
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
         with:
-          # must be specified without patch version
-          version: v1.46
-  cross:
-    name: Cross
-    timeout-minutes: 10
-    strategy:
-      matrix:
-        go-version: [1.17.x]
-        platform: [ubuntu-latest]
-    runs-on: ${{ matrix.platform }}
-    steps:
-      - name: Install Go
-        uses: actions/setup-go@v2
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
         with:
-          go-version: ${{ matrix.go-version }}
-      - name: Checkout code
-        uses: actions/checkout@v2
-      - name: Cross
-        working-directory: ci
-        run: go run mage.go -v -w ../ crossBuild
+          version: latest
 
   test:
-    name: Unit test
-    timeout-minutes: 10
+    name: Test (Go ${{ matrix.go-version }} / ${{ matrix.os }})
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        go-version: [1.17.x]
-        platform: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.platform }}
+        go-version: ['1.26.x']
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v2
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
-      - name: Checkout code
-        uses: actions/checkout@v2
-      - name: Test
-        run: go test -race -v ./...
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Test with race detector
+        run: go test -race -count=1 -timeout=120s ./...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: go mod tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum

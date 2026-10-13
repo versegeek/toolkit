@@ -41,3 +41,6 @@ node_modules
 *config.yaml
 *config.json
 *.conf
+
+# Local code index
+.codegraph/
