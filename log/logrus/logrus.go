@@ -1,118 +1,105 @@
-// Package logprovider provides a logrus logging Provider.
+// Package logrus configures the logrus standard logger as a provider. Init
+// also routes the slog default logger, which the toolkit itself logs
+// through, into logrus; Close restores the previous slog logger.
 //
-// Init configures the global logrus logger. Use this as the first provider
-// so that all subsequent Init logs use the configured format and level.
+// Initialise it before the other providers so that their logs use it:
 //
-// Standalone usage (Pattern A, no Wire):
-//
-//	c := container.New()
-//	c.MustInit(logprovider.New(nil))  // nil → reads from env/config.yaml
-//	c.MustInit(redis.New(nil))
-//	c.MustRun()
-//
-// Wire usage (Pattern B) – add logprovider.ProviderSet to wire.Build():
-//
-//	wire.Build(logprovider.NewConfigFromEnv, logprovider.NewClient, ...)
-package logprovider
+//	g.MustInit(logruslog.New(nil))
+//	g.MustInit(redis.New(nil))
+package logrus
 
 import (
+	"fmt"
 	"io"
+	"log/slog"
 	"os"
 
+	"github.com/google/wire"
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
+
+	"github.com/versegeek/toolkit/internal/logbridge"
 	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Client.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewClient)
 
-// Config holds logrus configuration.
-type Config struct {
-	Level        logrus.Level
-	Formatter    logrus.Formatter
-	Output       io.Writer
-	ReportCaller bool
-}
-
-const (
-	defaultLevel        = "info"
-	defaultFormatter    = "json"
-	defaultOutput       = "stderr"
-	defaultReportCaller = false
-)
-
-// NewConfigFromEnv reads logrus configuration from the environment.
-// Keys: LOGRUS_LEVEL, LOGRUS_FORMATTER (json|text|text_color), LOGRUS_OUTPUT (stderr|stdout), LOGRUS_REPORT_CALLER.
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("LOGRUS_LEVEL", defaultLevel)
-	v.SetDefault("LOGRUS_FORMATTER", defaultFormatter)
-	v.SetDefault("LOGRUS_OUTPUT", defaultOutput)
-	v.SetDefault("LOGRUS_REPORT_CALLER", defaultReportCaller)
-
-	level, err := logrus.ParseLevel(v.GetString("LOGRUS_LEVEL"))
-	if err != nil {
-		level = logrus.InfoLevel
-	}
-
-	var formatter logrus.Formatter
-	switch v.GetString("LOGRUS_FORMATTER") {
-	case "text":
-		formatter = &logrus.TextFormatter{}
-	case "text_color":
-		formatter = &logrus.TextFormatter{ForceColors: true, FullTimestamp: true}
-	default: // "json"
-		formatter = &logrus.JSONFormatter{}
-	}
-
-	var output io.Writer
-	switch v.GetString("LOGRUS_OUTPUT") {
-	case "stdout":
-		output = os.Stdout
-	default: // "stderr"
-		output = os.Stderr
-	}
-
-	return &Config{
-		Level:        level,
-		Formatter:    formatter,
-		Output:       output,
-		ReportCaller: v.GetBool("LOGRUS_REPORT_CALLER"),
-	}
-}
-
-// ─── Client ───────────────────────────────────────────────────────────────────
-
-// Client configures the global logrus logger as a lifecycle-managed Provider.
+// Client configures the logrus standard logger as a provider.
 type Client struct {
-	provider.AbstractProvider
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
 	Config *Config
+
+	restore func()
 }
 
 var _ provider.Provider = (*Client)(nil)
 
-// New creates a Client.
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Client that has not configured logrus yet.
 func New(cfg *Config) *Client {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Client{Config: cfg}
 }
 
-// NewClient is the Wire-compatible constructor.
+// NewClient returns an initialised Client and a cleanup that closes it.
 func NewClient(cfg *Config) (*Client, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Init applies the configuration to the global logrus logger.
+// Logger returns the configured logrus standard logger.
+func (c *Client) Logger() *logrus.Logger {
+	return logrus.StandardLogger()
+}
+
+// Init applies the settings to the logrus standard logger and routes the
+// slog default logger into it.
 func (c *Client) Init() error {
-	logrus.SetLevel(c.Config.Level)
-	logrus.SetFormatter(c.Config.Formatter)
-	logrus.SetOutput(c.Config.Output)
-	logrus.SetReportCaller(c.Config.ReportCaller)
+	if c.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		c.Config = cfg
+	}
+
+	level, err := logrus.ParseLevel(c.Config.Level)
+	if err != nil {
+		return fmt.Errorf("logrus: invalid level %q: %w", c.Config.Level, err)
+	}
+	var formatter logrus.Formatter
+	switch c.Config.Format {
+	case "json", "":
+		formatter = &logrus.JSONFormatter{}
+	case "text":
+		formatter = &logrus.TextFormatter{FullTimestamp: true}
+	default:
+		return fmt.Errorf("logrus: invalid format %q: want json or text", c.Config.Format)
+	}
+	var output io.Writer
+	switch c.Config.Output {
+	case "stderr", "":
+		output = os.Stderr
+	case "stdout":
+		output = os.Stdout
+	default:
+		return fmt.Errorf("logrus: invalid output %q: want stderr or stdout", c.Config.Output)
+	}
+
+	logger := logrus.StandardLogger()
+	logger.SetLevel(level)
+	logger.SetFormatter(formatter)
+	logger.SetOutput(output)
+	logger.SetReportCaller(c.Config.ReportCaller)
+
+	c.restore = logbridge.SetDefault(slog.New(newSlogHandler(logger)))
+	return nil
+}
+
+// Close restores the previous slog default logger.
+func (c *Client) Close() error {
+	if c.restore != nil {
+		c.restore()
+		c.restore = nil
+	}
 	return nil
 }

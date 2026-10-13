@@ -1,158 +1,83 @@
-// Package oauth2 provides an OAuth2 client Provider with token lifecycle management.
+// Package oauth2 provides an OAuth2 client (golang.org/x/oauth2) as a
+// provider, for both the authorization code flow and the client credentials
+// flow. Every request to the token endpoint is bounded by Config.Timeout.
 //
-// Supports both Authorization Code flow (user-facing) and Client Credentials
-// flow (server-to-server). Tokens are automatically refreshed on expiry.
+// Authorization code flow (user login):
 //
-// Standalone usage (Pattern A, no Wire):
-//
-//	c := container.New()
-//	c.MustInit(oauth2.New(nil))
-//	c.MustRun()
-//
-// Wire usage (Pattern B) – add oauth2.ProviderSet to wire.Build():
-//
-//	wire.Build(oauth2.NewConfigFromEnv, oauth2.NewClient, ...)
-//
-// # Authorization Code flow (user login)
-//
-//	// 1. Redirect user to authorization URL
-//	url := client.AuthURL("random-state")
-//
-//	// 2. Exchange code from callback for a token
+//	url := client.AuthURL(state)
 //	token, err := client.Exchange(ctx, code)
+//	httpClient, err := client.HTTPClient(ctx, token)
 //
-//	// 3. Make authenticated HTTP requests
-//	httpClient := client.HTTPClient(ctx, token)
+// Client credentials flow (service to service), with the token cached and
+// refreshed before it expires:
 //
-// # Client Credentials flow (server-to-server)
-//
-//	// Token is fetched and refreshed automatically
-//	token, err := client.Token(ctx)
+//	token, err := client.Token()
+//	httpClient, err := client.HTTPClient(ctx, nil)
 package oauth2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
-	"github.com/versegeek/toolkit/provider"
+	"github.com/google/wire"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
+
+	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Client.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewClient)
 
-// Config holds OAuth2 client parameters.
-type Config struct {
-	ClientID     string
-	ClientSecret string
+// errNoClientCredentials is returned when a client credentials operation is
+// used without Config.UseClientCredentials.
+var errNoClientCredentials = errors.New("oauth2: client credentials flow is not enabled (set UseClientCredentials)")
 
-	// AuthURL is the authorization endpoint (used for Authorization Code flow).
-	AuthURL string
-
-	// TokenURL is the token endpoint (used by both flows).
-	TokenURL string
-
-	// RedirectURL is the callback URL registered with the provider.
-	RedirectURL string
-
-	// Scopes is the list of requested OAuth2 scopes.
-	Scopes []string
-
-	// UseClientCredentials enables server-to-server token management.
-	// When true, Init() sets up an auto-refreshing token source.
-	UseClientCredentials bool
-}
-
-// NewConfigFromEnv reads OAuth2 configuration from the environment.
-// All keys are prefixed with OAUTH2_.
-//
-//   - OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET
-//   - OAUTH2_AUTH_URL, OAUTH2_TOKEN_URL, OAUTH2_REDIRECT_URL
-//   - OAUTH2_SCOPES (comma-separated, e.g. "openid,profile,email")
-//   - OAUTH2_USE_CLIENT_CREDENTIALS (bool, default false)
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("OAUTH2_CLIENT_ID", "")
-	v.SetDefault("OAUTH2_CLIENT_SECRET", "")
-	v.SetDefault("OAUTH2_AUTH_URL", "")
-	v.SetDefault("OAUTH2_TOKEN_URL", "")
-	v.SetDefault("OAUTH2_REDIRECT_URL", "")
-	v.SetDefault("OAUTH2_SCOPES", "")
-	v.SetDefault("OAUTH2_USE_CLIENT_CREDENTIALS", false)
-
-	cfg := &Config{
-		ClientID:             v.GetString("OAUTH2_CLIENT_ID"),
-		ClientSecret:         v.GetString("OAUTH2_CLIENT_SECRET"),
-		AuthURL:              v.GetString("OAUTH2_AUTH_URL"),
-		TokenURL:             v.GetString("OAUTH2_TOKEN_URL"),
-		RedirectURL:          v.GetString("OAUTH2_REDIRECT_URL"),
-		Scopes:               splitScopes(v.GetString("OAUTH2_SCOPES")),
-		UseClientCredentials: v.GetBool("OAUTH2_USE_CLIENT_CREDENTIALS"),
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"clientID":             cfg.ClientID,
-		"tokenURL":             cfg.TokenURL,
-		"useClientCredentials": cfg.UseClientCredentials,
-	}).Debug("OAuth2 config loaded")
-
-	return cfg
-}
-
-func splitScopes(s string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	scopes := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			scopes = append(scopes, t)
-		}
-	}
-	return scopes
-}
-
-// ─── Client ───────────────────────────────────────────────────────────────────
-
-// Client is a lifecycle-managed OAuth2 client.
-// It wraps golang.org/x/oauth2 and provides token management for both
-// Authorization Code and Client Credentials flows.
+// Client is an OAuth2 client managed as a provider.
 type Client struct {
 	provider.AbstractProvider
 
-	Config   *Config
-	oauthCfg *oauth2.Config
-	ccCfg    *clientcredentials.Config // non-nil only for client credentials flow
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
+	Config *Config
+
+	oauthConfig *oauth2.Config
+	httpClient  *http.Client
+	tokens      oauth2.TokenSource
 }
 
 var _ provider.Provider = (*Client)(nil)
 
-// New creates a Client without initializing.
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Client that is not initialised yet.
 func New(cfg *Config) *Client {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Client{Config: cfg}
 }
 
-// NewClient is the Wire-compatible constructor.
+// NewClient returns an initialised Client and a cleanup that closes it.
 func NewClient(cfg *Config) (*Client, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Init configures the OAuth2 client. For Client Credentials flow, it verifies
-// that the credentials are valid by fetching the first token eagerly.
+// Init prepares both flows. With the client credentials flow it fetches the
+// first token, which also checks the credentials.
 func (c *Client) Init() error {
-	c.oauthCfg = &oauth2.Config{
+	if c.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		c.Config = cfg
+	}
+
+	timeout := c.Config.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	c.httpClient = &http.Client{Timeout: timeout}
+	c.oauthConfig = &oauth2.Config{
 		ClientID:     c.Config.ClientID,
 		ClientSecret: c.Config.ClientSecret,
 		Endpoint: oauth2.Endpoint{
@@ -164,65 +89,84 @@ func (c *Client) Init() error {
 	}
 
 	if c.Config.UseClientCredentials {
-		c.ccCfg = &clientcredentials.Config{
+		cc := &clientcredentials.Config{
 			ClientID:     c.Config.ClientID,
 			ClientSecret: c.Config.ClientSecret,
 			TokenURL:     c.Config.TokenURL,
 			Scopes:       c.Config.Scopes,
 		}
-		// Eagerly verify credentials are valid.
-		if _, err := c.ccCfg.Token(context.Background()); err != nil {
-			return fmt.Errorf("oauth2: client credentials token fetch failed: %w", err)
+		// The context is kept by the token source for every refresh.
+		tokens := cc.TokenSource(c.withHTTPClient(context.Background()))
+		if _, err := tokens.Token(); err != nil {
+			return fmt.Errorf("oauth2: fetch client credentials token failed: %w", err)
 		}
+		c.tokens = tokens
 	}
-
 	return nil
 }
 
-// ─── Authorization Code flow ──────────────────────────────────────────────────
-
-// AuthURL returns the URL to redirect users to for authorization.
-// state should be a random, unguessable string to prevent CSRF.
+// AuthURL returns the authorization endpoint URL to redirect a user to.
+// state must be an unguessable value that the callback verifies.
 func (c *Client) AuthURL(state string, opts ...oauth2.AuthCodeOption) string {
-	return c.oauthCfg.AuthCodeURL(state, opts...)
+	return c.oauthConfig.AuthCodeURL(state, opts...)
 }
 
-// Exchange converts an authorization code (from the OAuth2 callback) into a token.
+// Exchange trades an authorization code from the callback for a token.
 func (c *Client) Exchange(ctx context.Context, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
-	return c.oauthCfg.Exchange(ctx, code, opts...)
-}
-
-// RefreshToken exchanges a refresh token for a new access token.
-func (c *Client) RefreshToken(ctx context.Context, refreshToken string) (*oauth2.Token, error) {
-	t := &oauth2.Token{RefreshToken: refreshToken}
-	src := c.oauthCfg.TokenSource(ctx, t)
-	newToken, err := src.Token()
+	token, err := c.oauthConfig.Exchange(c.withHTTPClient(ctx), code, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("oauth2: token refresh failed: %w", err)
+		return nil, fmt.Errorf("oauth2: exchange code failed: %w", err)
 	}
-	return newToken, nil
+	return token, nil
 }
 
-// HTTPClient returns an *http.Client that automatically attaches the Bearer
-// token to every request. Pass nil token to use client credentials.
-func (c *Client) HTTPClient(ctx context.Context, t *oauth2.Token) (*http.Client, error) {
-	if t == nil {
-		if c.ccCfg == nil {
-			return nil, fmt.Errorf("oauth2: no token provided and client credentials not configured")
-		}
-		return oauth2.NewClient(ctx, c.ccCfg.TokenSource(ctx)), nil
+// RefreshToken trades a refresh token for a new token.
+func (c *Client) RefreshToken(ctx context.Context, refreshToken string) (*oauth2.Token, error) {
+	token, err := c.oauthConfig.TokenSource(c.withHTTPClient(ctx), &oauth2.Token{RefreshToken: refreshToken}).Token()
+	if err != nil {
+		return nil, fmt.Errorf("oauth2: refresh token failed: %w", err)
 	}
-	return c.oauthCfg.Client(ctx, t), nil
+	return token, nil
 }
 
-// ─── Client Credentials flow ──────────────────────────────────────────────────
-
-// Token fetches a valid access token for the Client Credentials flow using ctx.
-// A new token is fetched if the cached one is expired; ctx controls the timeout.
-// Only available when UseClientCredentials is true.
-func (c *Client) Token(ctx context.Context) (*oauth2.Token, error) {
-	if c.ccCfg == nil {
-		return nil, fmt.Errorf("oauth2: client credentials not configured (set UseClientCredentials=true)")
+// Token returns the client credentials token, fetching a new one only when
+// the cached token has expired.
+func (c *Client) Token() (*oauth2.Token, error) {
+	if c.tokens == nil {
+		return nil, errNoClientCredentials
 	}
-	return c.ccCfg.Token(ctx)
+	token, err := c.tokens.Token()
+	if err != nil {
+		return nil, fmt.Errorf("oauth2: fetch client credentials token failed: %w", err)
+	}
+	return token, nil
+}
+
+// TokenSource returns the caching client credentials token source, or nil
+// when that flow is not enabled.
+func (c *Client) TokenSource() oauth2.TokenSource {
+	return c.tokens
+}
+
+// HTTPClient returns an *http.Client that authorises every request with
+// token, refreshing it when it expires. A nil token uses the client
+// credentials flow.
+func (c *Client) HTTPClient(ctx context.Context, token *oauth2.Token) (*http.Client, error) {
+	ctx = c.withHTTPClient(ctx)
+	if token != nil {
+		return c.oauthConfig.Client(ctx, token), nil
+	}
+	if c.tokens == nil {
+		return nil, errNoClientCredentials
+	}
+	return oauth2.NewClient(ctx, c.tokens), nil
+}
+
+// withHTTPClient makes token requests made with ctx use the client's
+// timeout-bounded HTTP client unless ctx already carries one.
+func (c *Client) withHTTPClient(ctx context.Context) context.Context {
+	if ctx.Value(oauth2.HTTPClient) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, oauth2.HTTPClient, c.httpClient)
 }

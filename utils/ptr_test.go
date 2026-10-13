@@ -34,7 +34,8 @@ func TestPtr_IndependentCopy(t *testing.T) {
 	v := 1
 	p := Ptr(v)
 	v = 99
-	assert.Equal(t, 1, *p, "Ptr should capture value at call time, not track mutations")
+	assert.NotEqual(t, v, *p, "Ptr should capture value at call time, not track mutations")
+	assert.Equal(t, 1, *p)
 }
 
 // --- Val ---

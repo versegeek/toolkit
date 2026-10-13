@@ -16,8 +16,11 @@ import (
 // InitApp wires all providers together and returns the assembled App.
 // The returned cleanup function closes all providers in reverse order.
 func InitApp() (*App, func(), error) {
-	config := zaplog.NewConfigFromEnv()
-	client, cleanup, err := zaplog.NewClient(config)
+	config, err := zap.NewConfigFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	client, cleanup, err := zap.NewClient(config)
 	if err != nil {
 		return nil, nil, err
 	}

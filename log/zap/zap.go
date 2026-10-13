@@ -1,154 +1,119 @@
-// Package zaplog provides a zap logging Provider.
+// Package zap provides a zap logger as a provider. Init also makes it the
+// process-wide logger: zap.L and zap.S return it and the slog default logger,
+// which the toolkit itself logs through, writes to it. Close flushes the
+// logger and restores the previous globals.
 //
-// Init replaces the global zap logger (zap.L / zap.S) and optionally creates
-// a structured per-component logger accessible via Client().Logger.
+// Initialise it before the other providers so that their logs use it:
 //
-// Standalone usage (Pattern A, no Wire):
-//
-//	c := container.New()
-//	c.MustInit(zaplog.New(nil))   // nil → reads from env/config.yaml
-//	c.MustInit(redis.New(nil))
-//	c.MustRun()
-//
-// Wire usage (Pattern B) – add zaplog.ProviderSet to wire.Build():
-//
-//	wire.Build(zaplog.NewConfigFromEnv, zaplog.NewClient, ...)
-package zaplog
+//	g.MustInit(zaplog.New(nil))
+//	g.MustInit(redis.New(nil))
+package zap
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
+	"syscall"
 
-	"github.com/spf13/viper"
-	"github.com/versegeek/toolkit/config"
-	"github.com/versegeek/toolkit/provider"
-	"go.uber.org/zap"
+	"github.com/google/wire"
+	uberzap "go.uber.org/zap"
+	"go.uber.org/zap/exp/zapslog"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/versegeek/toolkit/internal/logbridge"
+	"github.com/versegeek/toolkit/provider"
 )
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ProviderSet provides a *Config from the environment and an initialised
+// *Client.
+var ProviderSet = wire.NewSet(NewConfigFromEnv, NewClient)
 
-// Config holds zap logger configuration.
-type Config struct {
-	// Level is the minimum enabled logging level (debug/info/warn/error/dpanic/panic/fatal).
-	Level string
-	// Encoding selects the output format: "json" (default) or "console".
-	Encoding string
-	// OutputPaths is a list of URLs or file paths to write logging output to.
-	// Defaults to []string{"stderr"}.
-	OutputPaths []string
-	// Development puts the logger in development mode which changes the behaviour
-	// of DPanicLevel and takes stacktraces more liberally.
-	Development bool
-	// DisableCaller suppresses filename:line in every log entry.
-	DisableCaller bool
-	// DisableStacktrace suppresses automatic stacktrace capturing.
-	DisableStacktrace bool
-}
-
-const (
-	defaultZapLevel      = "info"
-	defaultZapEncoding   = "json"
-	defaultDevelopment   = false
-	defaultDisableCaller = false
-)
-
-// NewConfigFromEnv reads zap configuration from the environment.
-//
-// Keys: ZAP_LEVEL, ZAP_ENCODING (json|console), ZAP_OUTPUT (stderr|stdout|file path),
-// ZAP_DEVELOPMENT, ZAP_DISABLE_CALLER, ZAP_DISABLE_STACKTRACE.
-func NewConfigFromEnv() *Config {
-	v := viper.New()
-	config.LoadFromFile(v)
-
-	v.SetDefault("ZAP_LEVEL", defaultZapLevel)
-	v.SetDefault("ZAP_ENCODING", defaultZapEncoding)
-	v.SetDefault("ZAP_OUTPUT", "stderr")
-	v.SetDefault("ZAP_DEVELOPMENT", defaultDevelopment)
-	v.SetDefault("ZAP_DISABLE_CALLER", defaultDisableCaller)
-	v.SetDefault("ZAP_DISABLE_STACKTRACE", false)
-
-	return &Config{
-		Level:             v.GetString("ZAP_LEVEL"),
-		Encoding:          v.GetString("ZAP_ENCODING"),
-		OutputPaths:       []string{v.GetString("ZAP_OUTPUT")},
-		Development:       v.GetBool("ZAP_DEVELOPMENT"),
-		DisableCaller:     v.GetBool("ZAP_DISABLE_CALLER"),
-		DisableStacktrace: v.GetBool("ZAP_DISABLE_STACKTRACE"),
-	}
-}
-
-// ─── Client ───────────────────────────────────────────────────────────────────
-
-// Client wraps a *zap.Logger as a lifecycle-managed Provider.
-// It also replaces the process-wide global logger (zap.L / zap.S) on Init.
+// Client is a zap logger managed as a provider.
 type Client struct {
-	provider.AbstractProvider
-
+	// Config holds the settings; Init loads them from the environment when
+	// nil.
 	Config *Config
-	Logger *zap.Logger
+
+	logger  *uberzap.Logger
+	restore func()
 }
 
 var _ provider.Provider = (*Client)(nil)
 
-// New creates a Client without building the logger.
-// If config is nil, NewConfigFromEnv() is used.
+// New returns a Client whose logger is not built yet.
 func New(cfg *Config) *Client {
-	if cfg == nil {
-		cfg = NewConfigFromEnv()
-	}
 	return &Client{Config: cfg}
 }
 
-// NewClient is the Wire-compatible constructor.
+// NewClient returns an initialised Client and a cleanup that closes it.
 func NewClient(cfg *Config) (*Client, func(), error) {
 	return provider.InitProvider(New(cfg))
 }
 
-// Init builds the zap logger from Config and replaces the global logger.
+// Logger returns the zap logger. It is nil before Init.
+func (c *Client) Logger() *uberzap.Logger {
+	return c.logger
+}
+
+// Init builds the logger and installs it as the zap global logger and the
+// slog default logger.
 func (c *Client) Init() error {
+	if c.Config == nil {
+		cfg, err := NewConfigFromEnv()
+		if err != nil {
+			return err
+		}
+		c.Config = cfg
+	}
+
 	level, err := zapcore.ParseLevel(c.Config.Level)
 	if err != nil {
 		return fmt.Errorf("zap: invalid level %q: %w", c.Config.Level, err)
 	}
+	encoderConfig := uberzap.NewProductionEncoderConfig()
+	if c.Config.Development {
+		encoderConfig = uberzap.NewDevelopmentEncoderConfig()
+	}
+	outputs := c.Config.OutputPaths
+	if len(outputs) == 0 {
+		outputs = []string{"stderr"}
+	}
 
-	zapCfg := zap.Config{
-		Level:             zap.NewAtomicLevelAt(level),
+	logger, err := uberzap.Config{
+		Level:             uberzap.NewAtomicLevelAt(level),
 		Development:       c.Config.Development,
 		DisableCaller:     c.Config.DisableCaller,
 		DisableStacktrace: c.Config.DisableStacktrace,
 		Encoding:          c.Config.Encoding,
-		EncoderConfig:     encoderConfig(c.Config.Development),
-		OutputPaths:       c.Config.OutputPaths,
+		EncoderConfig:     encoderConfig,
+		OutputPaths:       outputs,
 		ErrorOutputPaths:  []string{"stderr"},
-	}
-
-	logger, err := zapCfg.Build()
+	}.Build()
 	if err != nil {
-		return fmt.Errorf("zap: failed to build logger: %w", err)
+		return fmt.Errorf("zap: build logger failed: %w", err)
 	}
 
-	c.Logger = logger
-	// Replace the global loggers so that zap.L() / zap.S() work everywhere.
-	zap.ReplaceGlobals(logger)
+	undoGlobals := uberzap.ReplaceGlobals(logger)
+	restoreSlog := logbridge.SetDefault(slog.New(
+		zapslog.NewHandler(logger.Core(), zapslog.WithCaller(!c.Config.DisableCaller)),
+	))
+	c.logger = logger
+	c.restore = func() {
+		restoreSlog()
+		undoGlobals()
+	}
 	return nil
 }
 
-// Close flushes buffered log entries. Should always be deferred.
+// Close flushes buffered entries and restores the previous global loggers.
 func (c *Client) Close() error {
-	if c.Logger != nil {
-		// Sync may return an error on some platforms (e.g., /dev/stderr on Linux);
-		// we intentionally ignore it to avoid noisy shutdown logs.
-		_ = c.Logger.Sync()
+	if c.logger == nil {
+		return nil
+	}
+	c.restore()
+	// Syncing a terminal or pipe fails with ENOTTY or EINVAL; that is harmless.
+	if err := c.logger.Sync(); err != nil && !errors.Is(err, syscall.ENOTTY) && !errors.Is(err, syscall.EINVAL) {
+		return fmt.Errorf("zap: sync failed: %w", err)
 	}
 	return nil
-}
-
-// encoderConfig returns sane encoder defaults for the given mode.
-func encoderConfig(development bool) zapcore.EncoderConfig {
-	if development {
-		cfg := zap.NewDevelopmentEncoderConfig()
-		cfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
-		return cfg
-	}
-	return zap.NewProductionEncoderConfig()
 }
