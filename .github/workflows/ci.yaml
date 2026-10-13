@@ -4,76 +4,55 @@ on:
   push:
     branches:
       - main
-      - master
-      - 'releases/**'
   pull_request:
-    branches:
-      - main
-      - master
   workflow_dispatch: {}
 
-jobs:
+permissions:
+  contents: read
 
+jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: go vet
-        run: go vet ./...
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.14.0
 
   test:
-    name: Test (Go ${{ matrix.go-version }} / ${{ matrix.os }})
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.26.x']
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        go: ['1.25.x', 'stable']
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version: ${{ matrix.go-version }}
-          cache: true
+          go-version: ${{ matrix.go }}
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race ./...
 
-      - name: Download modules
-        run: go mod download
-
-      - name: Test with race detector
-        run: go test -race -count=1 -timeout=120s ./...
-
-  build:
-    name: Build
+  generated:
+    name: Generated files
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [lint, test]
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: Build
-        run: go build ./...
-
-      - name: go mod tidy check
+      - name: go.mod and go.sum are tidy
         run: |
           go mod tidy
-          git diff --exit-code go.mod go.sum
+          git diff --exit-code -- go.mod go.sum
+      - name: wire_gen.go is up to date
+        run: make wire-check

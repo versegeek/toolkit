@@ -1,9 +1,15 @@
 include Makefile.def.mk
 
-.PHONY: tidy
-tidy:
-	export GOPROXY=https://goproxy.cn,direct
-	go mod tidy
+.PHONY: all
+all: lint test build
+
+.PHONY: build
+build:
+	go build ./...
+
+.PHONY: test
+test:
+	go test -race ./...
 
 .PHONY: lint
 lint: fmt vet golangci-lint
@@ -17,13 +23,19 @@ vet:
 	go vet ./...
 
 .PHONY: golangci-lint
+golangci-lint:
 	golangci-lint run ./...
 
+.PHONY: tidy
+tidy:
+	GOPROXY=$(GOPROXY) go mod tidy
+
+# Regenerate wire_gen.go for every injector package.
 .PHONY: wire
 wire:
-	@go install github.com/google/wire/cmd/wire@latest
-	@$(shell go env GOPATH)/bin/wire ./cmd/
+	$(WIRE) gen $(WIRE_PKGS)
 
-.PHONY: build
-build: wire
-	go build -o bin/server ./cmd/
+# Fail if any wire_gen.go is out of date.
+.PHONY: wire-check
+wire-check:
+	$(WIRE) diff $(WIRE_PKGS)
